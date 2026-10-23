@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Type checkers and linters
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# Editors and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Runtime state: a ledger is spend data, and a config holds the upstream key
+spendgate.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.env
+.env.*
+!.env.example

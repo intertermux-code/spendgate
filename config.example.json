@@ -1,0 +1,15 @@
+{
+  "upstream_base_url": "https://api.openai.com/v1",
+  "upstream_api_key": "REPLACE_ME-upstream-key-stays-server-side",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8080,
+  "ledger_path": "spendgate.sqlite",
+  "prices_path": null,
+  "webhook_url": null,
+  "soft_limit_fraction": 0.8,
+  "keys": {
+    "REPLACE_ME-vk-alice": { "label": "alice", "monthly_budget_usd": 20.0 },
+    "REPLACE_ME-vk-bob": { "label": "bob", "monthly_budget_usd": 5.0 },
+    "REPLACE_ME-vk-ci-bot": { "label": "ci-bot" }
+  }
+}
