@@ -1,4 +1,5 @@
-"""Shared test scaffolding: a mock OpenAI-compatible upstream and a live proxy.
+"""Shared test scaffolding: mock upstreams (OpenAI and Anthropic shapes) and a
+live proxy.
 
 The mock upstream is deliberately able to stall *mid-stream*. That is the only
 honest way to prove the proxy relays SSE incrementally instead of buffering: a
@@ -111,6 +112,135 @@ class MockUpstream(ThreadingHTTPServer):
         self.client_ack = threading.Event()
         self.streamed = threading.Event()
         self.pause_expired = False
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.server_address[1]}/v1"
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        return thread
+
+    def stop(self) -> None:
+        self.shutdown()
+        self.server_close()
+
+
+ANTHROPIC_KEY = "sk-ant-upstream-secret-DO-NOT-LEAK"
+
+
+def anthropic_message(model: str, prompt: int, completion: int, text: str = "hello") -> dict:
+    """A Messages response, shaped the way the real API answers."""
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": prompt, "output_tokens": completion},
+    }
+
+
+def anthropic_event(name: str, data: dict) -> str:
+    return f"event: {name}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+def anthropic_stream(model: str, texts: list[str], prompt: int, completion: int) -> list[str]:
+    """The event sequence a real Messages stream sends for a text-only answer."""
+    blocks = [
+        anthropic_event(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "usage": {"input_tokens": prompt, "output_tokens": 1},
+                },
+            },
+        ),
+        anthropic_event("ping", {"type": "ping"}),
+        anthropic_event(
+            "content_block_start",
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        ),
+    ]
+    blocks += [
+        anthropic_event(
+            "content_block_delta",
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+        )
+        for text in texts
+    ]
+    blocks += [
+        anthropic_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        anthropic_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": completion},
+            },
+        ),
+        anthropic_event("message_stop", {"type": "message_stop"}),
+    ]
+    return blocks
+
+
+class _MockAnthropicHandler(BaseHTTPRequestHandler):
+    server: "MockAnthropic"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = json.loads(raw)
+        self.server.received.append(
+            {
+                "path": self.path,
+                "body": body,
+                "x_api_key": self.headers.get("x-api-key", ""),
+                "anthropic_version": self.headers.get("anthropic-version", ""),
+                "authorization": self.headers.get("Authorization", ""),
+            }
+        )
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            for block in self.server.stream_blocks:
+                self.wfile.write(block.encode())
+                self.wfile.flush()
+            return
+        payload = json.dumps(self.server.json_response).encode()
+        self.send_response(self.server.json_status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class MockAnthropic(ThreadingHTTPServer):
+    """Stand-in for api.anthropic.com: the Messages shape, nothing else."""
+
+    daemon_threads = True
+
+    def __init__(self, stream_blocks: list[str], json_response: dict):
+        super().__init__(("127.0.0.1", 0), _MockAnthropicHandler)
+        self.received: list[dict] = []
+        self.stream_blocks = stream_blocks
+        self.json_response = json_response
+        self.json_status = 200
 
     @property
     def base_url(self) -> str:
@@ -243,6 +373,21 @@ class SocketReader:
         while self._fill(deadline):
             pass
         return self.buffer
+
+def await_rows(ledger: Ledger, count: int, timeout: float = 5.0) -> list:
+    """Rows once at least `count` of them exist.
+
+    The proxy hands the client its answer before appending the ledger row, so
+    reading immediately after a call is a coin flip. This waits for the write
+    instead of losing it.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = ledger.rows()
+        if len(rows) >= count or time.monotonic() >= deadline:
+            return rows
+        time.sleep(0.01)
+
 
 def seed_ledger(path: str, rows: list[dict]) -> Ledger:
     ledger = Ledger(path)

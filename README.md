@@ -4,12 +4,14 @@ An OpenAI-compatible proxy that answers "who spent what, and are we over
 budget?" with one Python process and one SQLite file. No Postgres, no Redis,
 no ClickHouse, no Docker.
 
-`spendgate` sits between your apps and an OpenAI-compatible upstream. Every
-developer or agent gets their own virtual key. Each call is forwarded, metered
-from the `usage` the upstream reports, and appended to a spend ledger. Keys can
-carry a monthly budget: a warning at 80% of the cap, a hard `429` at 100%.
-Because the ledger is a plain file, the report is `scp` plus a command — the
-server does not have to be running.
+`spendgate` sits between your apps and one or more upstreams: an
+OpenAI-compatible endpoint, or several of them split by model name, or Anthropic
+behind a translation layer. Every developer or agent gets their own virtual key.
+Each call is routed by model, forwarded, metered from the `usage` the upstream
+reports, and appended to a spend ledger. Keys can carry a monthly budget: a
+warning at 80% of the cap, a hard `429` at 100%. Because the ledger is a plain
+file, the report is `scp` plus a command — the server does not have to be
+running.
 
 ## Why this exists
 
@@ -122,8 +124,9 @@ own setting, which keeps secrets out of files on shared boxes.
 
 | Key | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `upstream_base_url` | `SPENDGATE_UPSTREAM_BASE_URL` | required | OpenAI-compatible base URL, including its `/v1` suffix |
-| `upstream_api_key` | `SPENDGATE_UPSTREAM_API_KEY` | required | the real provider key; only ever sent upstream |
+| `upstream_base_url` | `SPENDGATE_UPSTREAM_BASE_URL` | required without `upstreams` | OpenAI-compatible base URL, including its `/v1` suffix |
+| `upstream_api_key` | `SPENDGATE_UPSTREAM_API_KEY` | required without `upstreams` | the real provider key; only ever sent upstream |
+| `upstreams` | — | none | list of named upstreams, each serving a set of models; wins over the two fields above |
 | `listen_host` | `SPENDGATE_LISTEN_HOST` | `127.0.0.1` | bind address; `0.0.0.0` exposes the proxy to your network |
 | `listen_port` | `SPENDGATE_LISTEN_PORT` | `8080` | bind port |
 | `ledger_path` | `SPENDGATE_LEDGER_PATH` | `spendgate.sqlite` | the SQLite file; created on first write |
@@ -134,6 +137,105 @@ own setting, which keeps secrets out of files on shared boxes.
 
 `monthly_budget_usd` is optional per key. A key without one is still metered,
 never limited.
+
+### Multiple upstreams
+
+`upstreams` splits the models over several providers. Each entry names itself,
+points at a base URL, carries its own key, and lists the model names it serves:
+
+```json
+{
+  "listen_port": 8080,
+  "keys": { "REPLACE_ME-vk-alice": { "label": "alice", "monthly_budget_usd": 20.0 } },
+  "upstreams": [
+    {
+      "name": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "REPLACE_ME-openai-key",
+      "models": ["gpt-4", "o3-"]
+    },
+    {
+      "name": "deepseek",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "REPLACE_ME-deepseek-key",
+      "models": ["deepseek-*"]
+    },
+    {
+      "name": "claude",
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "api_key": "REPLACE_ME-anthropic-key",
+      "models": ["claude-"]
+    }
+  ]
+}
+```
+
+Routing rule: a request goes to the **first** entry in the list whose `models`
+match the requested model. A pattern is a prefix unless it contains glob
+characters (`gpt-4` matches `gpt-4o-mini`; `deepseek-*` matches
+`deepseek-chat`), so order matters — put the narrow entries first. `kind`
+defaults to `"openai"`; names must be unique.
+
+With `upstreams` present, `upstream_base_url` and `upstream_api_key` are
+ignored, and each entry's key can come from `SPENDGATE_<NAME>_API_KEY` instead
+of the file (`SPENDGATE_CLAUDE_API_KEY` for the entry named `claude`). Without
+it, the single-upstream configuration behaves exactly as it always has: one
+base URL, every model.
+
+A model no upstream serves is refused with `404` and
+`{"error": {"code": "model_not_found"}}` — nothing is forwarded, nothing is
+written to the ledger, and the call costs nothing. Per-upstream keys are sent
+only to the upstream they belong to and appear in no log line, no error body
+and no metric.
+
+### Anthropic upstreams
+
+An upstream with `"kind": "anthropic"` is reached through Anthropic's Messages
+API (`POST <base_url>/messages`, `x-api-key`, `anthropic-version: 2023-06-01`)
+while your clients keep speaking OpenAI. On the way out: `system` and
+`developer` messages become the `system` field, consecutive turns for one role
+are merged, `temperature`, `top_p` and `stop` carry over, and a client that
+omits `max_tokens` gets `4096` because Anthropic requires the field. On the way
+back: the answer is rebuilt as a `chat.completion`, and a streamed answer
+becomes OpenAI chunks — text deltas as they arrive, and a final chunk carrying
+`finish_reason: "stop"` plus the usage.
+
+The tokens Anthropic reports (`input_tokens`, `output_tokens`) are metered
+through the same price table and the same ledger, so an Anthropic-backed call
+shows up in `spendgate report` and in `/metrics` like any other.
+
+Scope is text. `tools`, `tool_choice`, `functions`, tool calls or tool results
+in `messages`, `n` greater than 1, empty turns and non-text content parts are
+refused with `400` and `unsupported_for_upstream` rather than quietly dropped.
+
+### Prometheus metrics
+
+`GET /metrics` on the proxy port answers in Prometheus text format
+(`text/plain; version=0.0.4`). It is infrastructure, so it needs no virtual key:
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `spendgate_requests_total` | counter | `key`, `model`, `status` |
+| `spendgate_tokens_total` | counter | `key`, `model`, `kind` (`prompt` / `completion`) |
+| `spendgate_cost_usd_total` | counter | `key`, `model` |
+| `spendgate_budget_fraction` | gauge | `key` — spend this UTC month over the cap |
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: spendgate
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+The completed-call families are aggregated from the ledger on every scrape, so
+a restart does not zero the spend it can still read from the file; requests
+that never reached the ledger (a `401`, a `429`, an unreachable upstream, an
+unroutable model) are counted in memory alongside it. `key` carries the key's
+*label*, never the key string, and an unknown model still counts requests and
+tokens while simply having no `spendgate_cost_usd_total` series — the price is
+never guessed.
 
 ### Prices
 
@@ -194,9 +296,13 @@ report against hand-computed costs.
   recorded with `NULL` tokens and `NULL` cost. Nothing is estimated.
 - **Unknown models cost `NULL`,** and `NULL` spend cannot trip a budget. Add the
   model to your price table if you need it capped.
-- **Only `POST /v1/chat/completions` is proxied.** Embeddings, images,
-  assistants, tool-calling round trips beyond what the endpoint carries, and
-  non-OpenAI providers' native shapes are out of scope for v1.
+- **Only `POST /v1/chat/completions` is proxied.** Embeddings, images and
+  assistants are out of scope and answer `404`.
+- **The Anthropic translation is text-only.** Messages requests are built from
+  text turns and answered with text. Tool definitions, tool calls, tool results,
+  images and audio are refused with a `400` that says so — spendgate never
+  pretends a tool round trip happened, and it does not translate any other part
+  of Anthropic's API surface.
 - **Prices are a maintained text file,** not a live feed. Check them against
   your provider.
 - **Virtual keys are labels, not real authentication.** They keep teammates and
@@ -206,14 +312,21 @@ report against hand-computed costs.
 - **No request or response bodies are stored.** You get token counts and cost,
   not a conversation history. That is deliberate — it is what keeps the ledger
   small enough to email.
+- **A scrape aggregates the whole ledger.** `/metrics` is a grouped read over
+  every row, so counters are lifetime totals and the read grows with the file.
+  Budgets stay month-scoped; the metrics do not.
 
 ## What spendgate is not
 
-This is a spend-control proxy. It is **not** a router, and it does not replace
+This is a spend-control proxy. It is **not** a router in the sense of choosing
+an answer for you: `upstreams` is a fixed map from model names to providers that
+you write, and a request for a model nothing serves is refused rather than
+substituted. It does not replace
 [llmroutes](https://github.com/intertermux-code/llmroutes), a benchmark-driven
 router CLI that picks the best model for a task. Different tools for different
 jobs: llmroutes chooses *which* model answers; spendgate decides *whose* calls
-these are and what they may cost. Use both if you want both.
+these are, which upstream they may reach, and what they may cost. Use both if
+you want both.
 
 ## License
 

@@ -71,7 +71,7 @@ class StreamingTest(unittest.TestCase):
 
     def test_usage_is_taken_from_the_final_chunk(self) -> None:
         self.stream()
-        row = self.proxy.gate.ledger.rows()[0]
+        row = s.await_rows(self.proxy.gate.ledger, 1)[0]
         self.assertEqual((row.key_label, row.model, row.prompt_tokens, row.completion_tokens), ("alice", MODEL, 11, 7))
         self.assertAlmostEqual(row.cost, (11 * 0.15 + 7 * 0.60) / 1_000_000, places=12)
 
@@ -88,7 +88,7 @@ class StreamingTest(unittest.TestCase):
         self.mock.pause_after_chunk = -1
         _, whole = self.stream(stalled=False)
         self.assertEqual(whole, "".join(self.mock.stream_blocks).encode())
-        row = self.proxy.gate.ledger.rows()[0]
+        row = s.await_rows(self.proxy.gate.ledger, 1)[0]
         self.assertEqual((row.model, row.prompt_tokens, row.completion_tokens, row.cost), (MODEL, None, None, None))
 
     def test_sse_framing_survives_the_relay(self) -> None:

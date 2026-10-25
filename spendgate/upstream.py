@@ -2,7 +2,8 @@
 
 The proxy speaks HTTP with the stdlib only (``urllib.request``), so the pieces
 that are easy to get wrong — streaming usage, SSE framing, which model name to
-bill — live here where they can be tested without a socket.
+bill, which auth header a provider wants — live here where they can be tested
+without a socket.
 """
 
 from __future__ import annotations
@@ -13,9 +14,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import __version__
-from .config import Config
+from .config import ANTHROPIC_KIND, UpstreamConfig
 
 UPSTREAM_SUFFIX = "chat/completions"
+ANTHROPIC_SUFFIX = "messages"
+
+# The documented version header for Anthropic's Messages API. Requests without
+# it are rejected outright, and the client never sees the value from here.
+ANTHROPIC_VERSION = "2023-06-01"
 
 
 @dataclass
@@ -25,16 +31,23 @@ class Usage:
     model: str | None
 
 
-def build_request(config: Config, payload: bytes, stream: bool) -> urllib.request.Request:
+def build_request(upstream: UpstreamConfig, payload: bytes, stream: bool) -> urllib.request.Request:
     """Build the forwarded request. The upstream key is attached here only."""
     headers = {
         "Content-Type": "application/json",
         "Content-Length": str(len(payload)),
-        "Authorization": f"Bearer {config.upstream_api_key}",
         "Accept": "text/event-stream" if stream else "application/json",
         "User-Agent": f"spendgate/{__version__}",
     }
-    return urllib.request.Request(config.upstream_url + UPSTREAM_SUFFIX, data=payload, headers=headers, method="POST")
+    if upstream.kind == ANTHROPIC_KIND:
+        # Anthropic authenticates with x-api-key and no bearer scheme.
+        headers["x-api-key"] = upstream.api_key
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+        suffix = ANTHROPIC_SUFFIX
+    else:
+        headers["Authorization"] = f"Bearer {upstream.api_key}"
+        suffix = UPSTREAM_SUFFIX
+    return urllib.request.Request(upstream.url + suffix, data=payload, headers=headers, method="POST")
 
 
 def inject_include_usage(payload: bytes) -> bytes:

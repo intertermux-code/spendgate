@@ -69,7 +69,7 @@ class PassthroughTest(ProxyTestCase):
 
     def test_ledger_row_carries_the_usage_the_upstream_reported(self) -> None:
         self.call()
-        rows = self.proxy.gate.ledger.rows()
+        rows = s.await_rows(self.proxy.gate.ledger, 1)
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual((row.key_label, row.model, row.prompt_tokens, row.completion_tokens), ("alice", MODEL, 1000, 250))
@@ -95,7 +95,7 @@ class UnknownModelTest(ProxyTestCase):
     def test_unknown_model_succeeds_with_null_cost(self) -> None:
         status, _ = self.call({"model": "vision-pro-9000"})
         self.assertEqual(status, 200)
-        row = self.proxy.gate.ledger.rows()[0]
+        row = s.await_rows(self.proxy.gate.ledger, 1)[0]
         self.assertIsNone(row.cost)
         self.assertEqual((row.model, row.prompt_tokens, row.completion_tokens), ("vision-pro-9000", 120, 40))
 

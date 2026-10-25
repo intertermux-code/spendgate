@@ -65,6 +65,23 @@ class GroupTotal:
     uncosted_calls: int
 
 
+@dataclass
+class KeyModelTotal:
+    """One metrics series' worth of rows: a key label against a model name.
+
+    The token sums stay ``None`` when no row in the group reported usage, which
+    is a different fact from "zero tokens" and is what the metrics endpoint
+    exposes.
+    """
+
+    key_label: str
+    model: str
+    calls: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cost: float | None
+
+
 class Ledger:
     """Thread-safe append-only ledger backed by SQLite."""
 
@@ -192,6 +209,35 @@ class Ledger:
                 uncosted_calls=uncosted,
             )
             for grp, calls, prompt_tokens, completion_tokens, cost, uncosted in rows
+        ]
+
+    def key_model_totals(self) -> list[KeyModelTotal]:
+        """Totals per key label and model, for the metrics endpoint.
+
+        Every row counts, costed or not: a scrape has to agree with the ledger
+        even for models that are absent from the price table.
+        """
+        sql = (
+            "SELECT key_label, model, COUNT(*), SUM(prompt_tokens), "
+            "SUM(completion_tokens), SUM(cost) FROM spend "
+            "GROUP BY key_label, model ORDER BY key_label, model"
+        )
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(sql).fetchall()
+            finally:
+                conn.close()
+        return [
+            KeyModelTotal(
+                key_label=key_label,
+                model=model,
+                calls=calls,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost=cost,
+            )
+            for key_label, model, calls, prompt_tokens, completion_tokens, cost in rows
         ]
 
     def row_count(self, month: str | None = None) -> int:

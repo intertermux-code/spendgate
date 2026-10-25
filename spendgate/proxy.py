@@ -1,7 +1,9 @@
 """The proxy: an OpenAI-compatible endpoint that meters what it forwards.
 
 Single process, threaded HTTP server from the stdlib. Every accepted call is
-written to the spend ledger exactly once, after the upstream has answered.
+written to the spend ledger exactly once, after the upstream has answered. The
+ledger is also what /metrics is computed from, so a scrape after a restart
+still reports the spend that survived.
 """
 
 from __future__ import annotations
@@ -15,8 +17,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import budgets, __version__
-from .config import Config, KeyConfig, default_prices_path
+from . import anthropic, budgets, metrics, __version__
+from .config import ANTHROPIC_KIND, Config, KeyConfig, UpstreamConfig, default_prices_path
 from .ledger import Ledger
 from .prices import compute_cost, load_prices
 from .upstream import SSEUsageScanner, Usage, build_request, inject_include_usage, usage_from_json
@@ -24,6 +26,7 @@ from .upstream import SSEUsageScanner, Usage, build_request, inject_include_usag
 logger = logging.getLogger("spendgate.proxy")
 
 COMPLETIONS_PATH = "/v1/chat/completions"
+METRICS_PATH = "/metrics"
 UPSTREAM_TIMEOUT_SECONDS = 300.0
 RELAY_BLOCK_BYTES = 8192
 
@@ -42,8 +45,13 @@ class Gate:
         self.config = config
         self.ledger = ledger
         self.prices = prices
+        self.outcomes = metrics.Outcomes()
         self._alerts_lock = threading.Lock()
         self._alerted: set[tuple[str, str]] = set()
+
+    def count(self, key_label: str | None, model: str | None, status: int) -> None:
+        """Tally a request the ledger will never see. Labels only, never keys."""
+        self.outcomes.note(key_label, model, status)
 
     def authenticate(self, token: str) -> KeyConfig | None:
         """Look up a virtual key in constant time; unknown keys get None."""
@@ -104,11 +112,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/healthz":
             self._respond(200, json.dumps({"status": "ok", "version": __version__}).encode())
+        elif self.path == METRICS_PATH:
+            # Infrastructure, not a client call: no virtual key is asked for.
+            gate = self.server.gate
+            self._respond(
+                200,
+                metrics.exposition(gate.config, gate.ledger, gate.outcomes),
+                content_type=metrics.CONTENT_TYPE,
+            )
         else:
             self._respond(404, openai_error("Not found", "invalid_request_error", "path_not_found"))
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        gate = self.server.gate
         if self.path != COMPLETIONS_PATH:
+            gate.count(None, None, 404)
             self._reject(404, "Not found", "invalid_request_error", "path_not_found")
             return
 
@@ -116,6 +134,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if key is None:
             # Rejected before the ledger and before the upstream: an unknown
             # key must not be able to grow anyone's spend.
+            gate.count(None, None, 401)
             self._reject(401, "Invalid API key", "authentication_error", "invalid_api_key")
             return
 
@@ -123,19 +142,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # OpenAI clients always send one, so this is a bad request, not a gap.
         body = self._read_json_body()
         if body is None:
+            gate.count(key.label, None, 400)
             self._reject(400, "Request body must be a JSON object with a Content-Length", "invalid_request_error", "invalid_json")
             return
         model = body.get("model")
         if not isinstance(model, str) or not model:
+            gate.count(key.label, None, 400)
             self._reject(400, "Request body must name a 'model'", "invalid_request_error", "missing_model", param="model")
             return
 
-        gate = self.server.gate
+        upstream = gate.config.route(model)
+        if upstream is None:
+            # Nothing serves this model, so nothing is forwarded and nothing is
+            # metered: an unroutable call cannot cost anything.
+            gate.count(key.label, model, 404)
+            self._reject(
+                404,
+                f"No configured upstream serves model {model!r}",
+                "invalid_request_error",
+                "model_not_found",
+                param="model",
+            )
+            return
+
         month = budgets.current_month()
         decision = budgets.check(gate.ledger, key, gate.config.soft_limit_fraction)
         if decision.level == budgets.SOFT:
             gate.note_soft_limit(key, decision, month)
         if not decision.allowed:
+            gate.count(key.label, model, 429)
             self._reject(
                 429,
                 f"Monthly budget of ${decision.cap_usd:.2f} for key {key.label!r} is exhausted "
@@ -145,11 +180,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
-        payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
         streaming = body.get("stream") is True
+        try:
+            payload = self._outbound_payload(upstream, body, streaming)
+        except anthropic.UnsupportedRequest as error:
+            gate.count(key.label, model, 400)
+            self._reject(400, str(error), "invalid_request_error", "unsupported_for_upstream", param="messages")
+            return
+
+        self._forward(gate, key, upstream, payload, streaming, model)
+
+    @staticmethod
+    def _outbound_payload(upstream: UpstreamConfig, body: dict[str, Any], streaming: bool) -> bytes:
+        if upstream.kind == ANTHROPIC_KIND:
+            return json.dumps(anthropic.to_request(body), separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
         if streaming:
-            payload = inject_include_usage(payload)
-        self._forward(gate, key, payload, streaming, model)
+            return inject_include_usage(encoded)
+        return encoded
 
     # -- plumbing ---------------------------------------------------------
 
@@ -174,24 +222,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def _forward(self, gate: Gate, key: KeyConfig, payload: bytes, streaming: bool, model: str) -> None:
-        request = build_request(gate.config, payload, streaming)
+    def _forward(self, gate: Gate, key: KeyConfig, upstream: UpstreamConfig, payload: bytes, streaming: bool, model: str) -> None:
+        request = build_request(upstream, payload, streaming)
         try:
             response = urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS)
         except urllib.error.HTTPError as error:
             # An upstream refusal is relayed as-is; nothing was metered because
             # nothing was generated.
+            gate.count(key.label, model, error.code)
             with error:
-                self._respond(error.code, error.read(), content_type=_content_type(error.headers))
+                body = error.read()
+            if upstream.kind == ANTHROPIC_KIND:
+                body = anthropic.to_error(body, error.code) or body
+            self._respond(error.code, body, content_type=_content_type(error.headers))
             return
         except (urllib.error.URLError, OSError) as error:
             logger.error("upstream unreachable: %s", error.reason if isinstance(error, urllib.error.URLError) else error)
+            gate.count(key.label, model, 502)
             self._reject(502, "Upstream provider unreachable", "api_error", "upstream_unreachable")
             return
 
         usage: Usage | None = None
         try:
-            if streaming and _is_event_stream(response.headers):
+            if upstream.kind == ANTHROPIC_KIND:
+                event_stream = streaming and _is_event_stream(response.headers)
+                usage = self._relay_anthropic(response, event_stream)
+            elif streaming and _is_event_stream(response.headers):
                 usage = self._relay_stream(response)
             else:
                 usage = self._relay_buffered(response)
@@ -212,6 +268,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return usage_from_json(json.loads(body))
         except (ValueError, UnicodeDecodeError):
             return None
+
+    def _relay_anthropic(self, response: Any, event_stream: bool) -> Usage | None:
+        """Hand the client an OpenAI-shaped answer, whichever way Anthropic sent it."""
+        if event_stream:
+            return self._relay_anthropic_stream(response)
+        body = response.read()
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            self._respond(response.status, body, content_type=_content_type(response.headers))
+            return None
+        if not isinstance(payload, dict) or payload.get("type") != "message":
+            # Not a message (an error shape, or something odd): relay it.
+            self._respond(response.status, body, content_type=_content_type(response.headers))
+            return None
+        completion = json.dumps(anthropic.to_completion(payload), separators=(",", ":")).encode("utf-8")
+        self._respond(response.status, completion)
+        return anthropic.usage_of(payload)
+
+    def _relay_anthropic_stream(self, response: Any) -> Usage | None:
+        """Translate Anthropic events into OpenAI chunks as they land."""
+        self.send_response(response.status)
+        self.send_header("Content-Type", _content_type(response.headers))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        translator = anthropic.StreamTranslator()
+        while True:
+            block = response.read1(RELAY_BLOCK_BYTES)
+            if not block:
+                break
+            translated = translator.feed(block)
+            if translated:
+                self.wfile.write(translated)
+                self.wfile.flush()
+        tail = translator.close()
+        if tail:
+            self.wfile.write(tail)
+        self.wfile.flush()
+        return translator.usage
 
     def _relay_stream(self, response: Any) -> Usage | None:
         """Copy SSE bytes to the client as they land, metering on the side."""
@@ -287,7 +385,10 @@ def run(config: Config) -> None:
     """Serve until interrupted. This is what `spendgate serve` calls."""
     gate = build_gate(config)
     server = ProxyServer(gate)
-    print(f"spendgate: forwarding {config.upstream_base_url} on http://{server.server_address[0]}:{server.server_address[1]}")
+    print(f"spendgate: forwarding on http://{server.server_address[0]}:{server.server_address[1]}")
+    for upstream in config.active_upstreams:
+        served = ", ".join(pattern for pattern in upstream.models if pattern) or "any model"
+        print(f"spendgate: upstream {upstream.name} ({upstream.kind}) at {upstream.base_url} for {served}")
     print(f"spendgate: {len(config.keys)} virtual key(s), ledger at {config.ledger_path}")
     try:
         server.serve()

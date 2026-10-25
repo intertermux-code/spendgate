@@ -89,7 +89,7 @@ class OverCapTest(BudgetTestCase):
         self.assertEqual(payload["error"]["code"], "budget_exceeded")
         self.assertIn("budget", payload["error"]["message"].lower())
         self.assertNotIn(s.UPSTREAM_KEY, str(payload))
-        self.assertEqual(len(self.proxy.gate.ledger.rows()), 1, "a refused call is not a spend row")
+        self.assertEqual(len(s.await_rows(self.proxy.gate.ledger, 1)), 1, "a refused call is not a spend row")
 
 
 class ExactlyAtSoftFractionTest(BudgetTestCase):
@@ -109,7 +109,7 @@ class UncappedKeyTest(BudgetTestCase):
         status, _ = self.call()
         self.assertEqual(status, 200)
         self.assertEqual(self.webhook.payloads, [])
-        self.assertEqual(len(self.proxy.gate.ledger.rows()), 2)
+        self.assertEqual(len(s.await_rows(self.proxy.gate.ledger, 2)), 2)
 
 
 class BudgetUnitTest(unittest.TestCase):
