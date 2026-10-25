@@ -1,0 +1,70 @@
+name: Publish
+
+# Publishing is trusted-publishing only: no credentials live here. The one-time
+# PyPI-side setup is documented in the README's Releasing section.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Tag must agree with pyproject.toml
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import sys
+          import tomllib
+
+          declared = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          tagged = os.environ["GITHUB_TAG"].removeprefix("v")
+          if tagged != declared:
+              sys.exit(f"refusing to publish: tag says {tagged!r} but pyproject.toml says {declared!r}")
+          print(f"spendgate {declared}: tag and pyproject.toml agree")
+          PY
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Check the distributions
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+
+  publish:
+    # Split from the build so what reaches the index is exactly what twine check
+    # approved, and id-token is granted only to the step that needs it.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

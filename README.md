@@ -1,5 +1,8 @@
 # spendgate
 
+[![PyPI](https://img.shields.io/pypi/v/spendgate)](https://pypi.org/project/spendgate/)
+![Tests](https://github.com/intertermux-code/spendgate/actions/workflows/test.yml/badge.svg)
+
 An OpenAI-compatible proxy that answers "who spent what, and are we over
 budget?" with one Python process and one SQLite file. No Postgres, no Redis,
 no ClickHouse, no Docker.
@@ -271,13 +274,54 @@ body.
 
 ```sh
 pip install -e .
-python -m unittest discover      # stdlib unittest, no pytest
+python -m unittest discover      # stdlib unittest, no pytest — 150 tests
 python scripts/smoke.py          # live proxy process + curl + report
 ```
 
 `scripts/smoke.py` starts a mock upstream and a real `spendgate serve`, drives
 one streaming and one non-streaming call through it with curl, and checks the
 report against hand-computed costs.
+
+## Releasing
+
+`.github/workflows/publish.yml` does the publishing: push a `v*` tag, or run the
+workflow by hand, and it builds an sdist and a wheel, checks them with
+`twine check`, and uploads both to PyPI over OIDC trusted publishing. There is
+no API token in the repository to keep secret, and nothing to rotate.
+
+A release is two edits and a tag:
+
+1. Bump `version` in `pyproject.toml` **and** `__version__` in
+   `spendgate/__init__.py`. They have to agree; `tests/test_version.py` fails if
+   they drift, and the workflow additionally refuses a tag whose version does
+   not match `pyproject.toml`.
+2. Tag the commit `v` plus that version, and push the tag:
+
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+**Once, before the first release:** PyPI has to be told which workflow is
+allowed to publish this project. On PyPI, open the **spendgate** project →
+**Manage** → **Publishing** → **Add a trusted publisher**, and enter:
+
+| Field | Value |
+| --- | --- |
+| Publisher | GitHub Actions |
+| Account name | `intertermux-code` |
+| Repository name | `spendgate` |
+| Workflow name | `publish.yml` |
+
+PyPI matches the workflow *file* name, so `.github/workflows/publish.yml` is
+registered as `publish.yml` — rename that file and this registration has to
+change with it. Until the publisher is registered, the publish job fails when
+PyPI rejects the OIDC token; that is the intended refusal, not something to
+work around.
+
+Running the workflow from `workflow_dispatch` has no tag to check, so it
+publishes whatever version `pyproject.toml` says. The index refuses a
+re-upload of a version that already exists, so an accidental repeat cannot
+overwrite a release that is out there.
 
 ## Limitations, honestly
 

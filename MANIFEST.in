@@ -1,0 +1,9 @@
+# A release archive carries the package plus the few files a reader needs; the
+# rest of the development tree stays in the repository. setuptools adds an
+# untracked setup.cfg stub and an egg-info SOURCES.txt of its own to every sdist
+# and cannot be talked out of it, so those two are expected here.
+prune tests
+prune .pytest_cache
+prune __pycache__
+prune *.egg-info
+global-exclude *.py[cod]

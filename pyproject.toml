@@ -1,27 +1,30 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "spendgate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zero-infrastructure LLM spend/budget gateway — an OpenAI-compatible proxy with an append-only SQLite ledger and per-key budgets."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
-authors = [{ name = "Clawdyy" }]
+license = "MIT"
+authors = [{ name = "Clawdyy", email = "intertermux@gmail.com" }]
 keywords = ["llm", "openai", "proxy", "budget", "spend", "gateway"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 
 [project.scripts]
 spendgate = "spendgate.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/intertermux-code/spendgate"
+Repository = "https://github.com/intertermux-code/spendgate"
 
 [tool.setuptools]
 packages = ["spendgate"]
