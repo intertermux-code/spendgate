@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
+import re
 import unittest
 
 from spendgate.cli import build_parser
@@ -40,6 +42,17 @@ class ShippedFilesTest(unittest.TestCase):
         self.assertIn("REPLACE_ME", raw)
         self.assertNotIn("sk-", raw)
         self.assertNotIn(str(pathlib.Path.home()), raw)
+
+    def test_the_quickstart_key_is_a_key_the_template_ships(self) -> None:
+        # The quickstart tells the reader to copy config.example.json, then
+        # hands them a client snippet: a virtual key the template does not
+        # define is refused at the gate, and nothing in the error says why.
+        readme = (ROOT / "README.md").read_text()
+        keys = json.loads((ROOT / "config.example.json").read_text())["keys"]
+        used = re.findall(r'api_key="([^"]+)"', readme) + re.findall(r"Bearer ([A-Za-z0-9_-]+)", readme)
+        self.assertTrue(used)
+        for key in used:
+            self.assertIn(key, keys)
 
     def test_the_models_the_readme_shows_are_priceable(self) -> None:
         prices = load_prices(ROOT / "spendgate" / "prices.json")
@@ -88,6 +101,30 @@ class CliTest(unittest.TestCase):
             code = main(["serve", "-c", str(ROOT / "does-not-exist.json")])
         self.assertEqual(code, 1)
         self.assertIn("config.example.json", errors.getvalue())
+
+    def test_serve_reports_malformed_keys_instead_of_traceback(self) -> None:
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+
+        from spendgate.cli import main
+
+        path = pathlib.Path(tempfile.mkdtemp()) / "spendgate.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "upstream_base_url": "http://x/v1",
+                    "upstream_api_key": "k",
+                    "keys": ["vk-one", "vk-two"],
+                }
+            )
+        )
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            code = main(["serve", "-c", str(path)])
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertIn("spendgate: config: 'keys' must be an object", errors.getvalue())
 
 
 if __name__ == "__main__":

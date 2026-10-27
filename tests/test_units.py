@@ -248,6 +248,21 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_config(self.write({"upstream_base_url": "http://x/v1", "upstream_api_key": "k"}))
 
+    def test_keys_must_be_an_object_and_says_so(self) -> None:
+        # Hand-writing a config invites a list of keys; dereferencing .items()
+        # on one used to be an AttributeError on the user's terminal.
+        for wrong in (
+            ["vk-one", "vk-two"],
+            [{"label": "alice"}],
+            "vk-one",
+            7,
+            None,
+        ):
+            with self.subTest(keys=wrong):
+                with self.assertRaises(ValueError) as caught:
+                    load_config(self.write({"upstream_base_url": "http://x/v1", "upstream_api_key": "k", "keys": wrong}))
+                self.assertIn("'keys'", str(caught.exception))
+
     def test_bad_soft_limit_fraction(self) -> None:
         with self.assertRaises(ValueError):
             load_config(self.write({"upstream_base_url": "http://x/v1", "upstream_api_key": "k", "keys": {"a": "b"}, "soft_limit_fraction": 1.5}))

@@ -120,7 +120,9 @@ def env_var_for(name: str) -> str:
     return f"SPENDGATE_{slug}_API_KEY"
 
 
-def _coerce_keys(raw: dict[str, Any]) -> dict[str, KeyConfig]:
+def _coerce_keys(raw: Any) -> dict[str, KeyConfig]:
+    if not isinstance(raw, dict):
+        raise ValueError("config: 'keys' must be an object mapping each virtual key to a label or an options object")
     out: dict[str, KeyConfig] = {}
     for k, v in raw.items():
         if isinstance(v, dict):

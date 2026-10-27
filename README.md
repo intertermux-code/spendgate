@@ -274,7 +274,7 @@ body.
 
 ```sh
 pip install -e .
-python -m unittest discover      # stdlib unittest, no pytest — 150 tests
+python -m unittest discover      # stdlib unittest, no pytest — 153 tests
 python scripts/smoke.py          # live proxy process + curl + report
 ```
 

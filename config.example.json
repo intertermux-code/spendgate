@@ -8,8 +8,8 @@
   "webhook_url": null,
   "soft_limit_fraction": 0.8,
   "keys": {
-    "REPLACE_ME-vk-alice": { "label": "alice", "monthly_budget_usd": 20.0 },
-    "REPLACE_ME-vk-bob": { "label": "bob", "monthly_budget_usd": 5.0 },
-    "REPLACE_ME-vk-ci-bot": { "label": "ci-bot" }
+    "vk-alice-dev-key-000000": { "label": "alice", "monthly_budget_usd": 20.0 },
+    "vk-bob-agent-key-000000": { "label": "bob", "monthly_budget_usd": 5.0 },
+    "vk-ci-bot-key-000000000": { "label": "ci-bot" }
   }
 }
