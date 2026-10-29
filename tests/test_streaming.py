@@ -102,3 +102,104 @@ class StreamingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TruncatedStreamTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.key = "vk-alice"
+        self.mock = s.MockUpstream(stream_blocks=[], json_response={})
+        self.mock.start()
+        self.config = s.make_config(self.tmp, keys={self.key: KeyConfig(label="alice")}, upstream=self.mock.base_url)
+        self.proxy = s.ProxyHandle(build_gate(self.config))
+
+    def tearDown(self) -> None:
+        try:
+            self.proxy.stop()
+        except Exception:
+            pass
+        try:
+            self.mock.stop()
+        except Exception:
+            pass
+
+    def test_truncated_chunked_stream_ends_cleanly_with_error_and_ledger_row(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        class TruncHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                _ = json.loads(raw)
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                chunk1 = s.sse_chunk("Hel", MODEL).encode()
+                self.wfile.write(f"{len(chunk1):X}\r\n".encode())
+                self.wfile.write(chunk1)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                chunk2 = s.sse_chunk("lo", MODEL).encode()
+                self.wfile.write(f"{len(chunk2):X}\r\n".encode())
+                self.wfile.write(chunk2[:3])
+                self.wfile.flush()
+                self.connection.close()
+
+        class TruncUpstream(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def __init__(self):
+                super().__init__(("127.0.0.1", 0), TruncHandler)
+
+            @property
+            def base_url(self):
+                return f"http://127.0.0.1:{self.server_address[1]}/v1"
+
+            def start(self):
+                t = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+                t.start()
+                return t
+
+            def stop(self):
+                self.shutdown()
+                self.server_close()
+
+        trunc = TruncUpstream()
+        trunc.start()
+        try:
+            try:
+                self.proxy.stop()
+            except Exception:
+                pass
+            try:
+                self.mock.stop()
+            except Exception:
+                pass
+            self.config = s.make_config(self.tmp, keys={self.key: KeyConfig(label="alice")}, upstream=trunc.base_url)
+            self.proxy = s.ProxyHandle(build_gate(self.config))
+
+            body = {"model": MODEL, "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            sock = s.raw_stream_request(self.proxy.base_url + "/v1/chat/completions", body, self.key)
+            reader = s.SocketReader(sock)
+            try:
+                head = reader.read_until(b"\r\n\r\n", timeout=2)
+                self.assertIn(b"200 OK", head.split(b"\r\n", 1)[0])
+                rest = reader.read_all(timeout=3)
+                self.assertTrue(len(rest) > 0)
+                self.assertIn(b"truncated", rest)
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+            rows = s.await_rows(self.proxy.gate.ledger, 1, timeout=3)
+            self.assertEqual(len(rows), 1)
+        finally:
+            trunc.stop()

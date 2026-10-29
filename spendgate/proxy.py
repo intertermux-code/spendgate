@@ -14,6 +14,7 @@ import logging
 import threading
 import urllib.error
 import urllib.request
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -256,13 +257,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # record but the fact that the call happened. Inventing a count
             # would be worse than a NULL.
             logger.info("client disconnected before the response finished")
+        except IncompleteRead:
+            # Should be handled in stream relays, but just in case
+            logger.info("incomplete read from upstream")
         finally:
-            response.close()
+            try:
+                response.close()
+            except Exception:
+                pass
 
         gate.record(key, usage, model)
 
     def _relay_buffered(self, response: Any) -> Usage | None:
-        body = response.read()
+        try:
+            body = response.read()
+        except IncompleteRead as e:
+            body = e.partial if hasattr(e, "partial") else b""
+            try:
+                self._respond(response.status, body, content_type=_content_type(response.headers))
+            except Exception:
+                pass
+            try:
+                return usage_from_json(json.loads(body))
+            except Exception:
+                return None
         self._respond(response.status, body, content_type=_content_type(response.headers))
         try:
             return usage_from_json(json.loads(body))
@@ -297,19 +315,64 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         translator = anthropic.StreamTranslator()
-        while True:
-            block = response.read1(RELAY_BLOCK_BYTES)
-            if not block:
-                break
-            translated = translator.feed(block)
-            if translated:
-                self.wfile.write(translated)
+        try:
+            while True:
+                try:
+                    block = response.read1(RELAY_BLOCK_BYTES)
+                except IncompleteRead:
+                    try:
+                        err = openai_error(
+                            "Upstream response truncated",
+                            "api_error",
+                            "upstream_truncated",
+                        )
+                        self.wfile.write(f"data: {err.decode()}\n\n".encode("utf-8"))
+                    except Exception:
+                        pass
+                    break
+                if not block:
+                    break
+                translated = translator.feed(block)
+                if translated:
+                    try:
+                        self.wfile.write(translated)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        raise
+            tail = translator.close()
+            if tail:
+                try:
+                    self.wfile.write(tail)
+                except Exception:
+                    pass
+            try:
                 self.wfile.flush()
-        tail = translator.close()
-        if tail:
-            self.wfile.write(tail)
-        self.wfile.flush()
-        return translator.usage
+            except Exception:
+                pass
+            return translator.usage
+        except IncompleteRead:
+            try:
+                err = openai_error(
+                    "Upstream response truncated",
+                    "api_error",
+                    "upstream_truncated",
+                )
+                self.wfile.write(f"data: {err.decode()}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                pass
+            try:
+                tail = translator.close()
+                if tail:
+                    try:
+                        self.wfile.write(tail)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return translator.usage
+        except (BrokenPipeError, ConnectionResetError):
+            raise
 
     def _relay_stream(self, response: Any) -> Usage | None:
         """Copy SSE bytes to the client as they land, metering on the side."""
@@ -321,18 +384,54 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         scanner = SSEUsageScanner()
-        while True:
-            # read1 hands back whatever the socket holds instead of waiting to
-            # fill a whole block — that is what keeps this unbuffered.
-            block = response.read1(RELAY_BLOCK_BYTES)
-            if not block:
-                break
-            self.wfile.write(block)
-            self.wfile.flush()
-            scanner.feed(block)
-        scanner.close()
-        self.wfile.flush()
-        return scanner.usage
+        try:
+            while True:
+                # read1 hands back whatever the socket holds instead of waiting to
+                # fill a whole block — that is what keeps this unbuffered.
+                try:
+                    block = response.read1(RELAY_BLOCK_BYTES)
+                except IncompleteRead:
+                    # Upstream closed mid-stream; terminate the client stream
+                    # cleanly with a visible error chunk.
+                    try:
+                        err = openai_error(
+                            "Upstream response truncated",
+                            "api_error",
+                            "upstream_truncated",
+                        )
+                        self.wfile.write(f"data: {err.decode()}\n\n".encode("utf-8"))
+                    except Exception:
+                        pass
+                    break
+                if not block:
+                    break
+                try:
+                    self.wfile.write(block)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    raise
+                scanner.feed(block)
+            scanner.close()
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            return scanner.usage
+        except IncompleteRead:
+            try:
+                err = openai_error(
+                    "Upstream response truncated",
+                    "api_error",
+                    "upstream_truncated",
+                )
+                self.wfile.write(f"data: {err.decode()}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                pass
+            scanner.close()
+            return scanner.usage
+        except (BrokenPipeError, ConnectionResetError):
+            raise
 
     def _respond(self, status: int, body: bytes, content_type: str = "application/json") -> None:
         self.send_response(status)
