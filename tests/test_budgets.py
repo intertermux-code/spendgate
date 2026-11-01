@@ -131,7 +131,9 @@ class BudgetUnitTest(unittest.TestCase):
         key = KeyConfig(label="bob", monthly_budget_usd=10.0)
         for spent, level in ((0.0, budgets.OK), (7.99, budgets.OK), (8.0, budgets.SOFT), (9.99, budgets.SOFT), (10.0, budgets.HARD), (12.0, budgets.HARD)):
             ledger = Ledger(pathlib.Path(tempfile.mkdtemp()) / "l.sqlite")
-            ledger.record(key_label="bob", model=MODEL, prompt_tokens=1, completion_tokens=1, cost=spent)
+            # The spend has to land in the month `now` is standing in: an
+            # untimestamped row falls back to the wall clock and reads back 0.
+            ledger.record(key_label="bob", model=MODEL, prompt_tokens=1, completion_tokens=1, cost=spent, timestamp=now.isoformat())
             self.assertEqual(budgets.check(ledger, key, 0.8, now).level, level, f"spent={spent}")
 
     def test_uncapped_key_reports_ok_with_a_running_total(self) -> None:
